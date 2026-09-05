@@ -14,6 +14,8 @@
 #include <atomic>
 #include <initializer_list>
 
+HMODULE g_hModule = nullptr; // this DLL's own module handle, set in DllMain
+
 // ============================================================
 // SA-MP 0.3.7-R1 "Detective - Code Decoder" auto-solver
 //
@@ -517,18 +519,58 @@ namespace GameInput
         return data.hwnd;
     }
 
+    // Makes sure our synthetic input actually lands on the game: SendInput
+    // delivers to whatever window currently has OS-level keyboard focus,
+    // same as real hardware input would. If the game somehow isn't
+    // foreground (e.g. focus slipped after alt-tab), force it back —
+    // this is a no-op in the normal case where the player is actively
+    // playing when they trigger this.
+    void EnsureForeground(HWND hwnd)
+    {
+        if (GetForegroundWindow() != hwnd)
+        {
+            SetForegroundWindow(hwnd);
+            Sleep(50);
+        }
+    }
+
+    void SendVKEvent(WORD vk, DWORD flags)
+    {
+        INPUT input = {};
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = vk;
+        input.ki.dwFlags = flags;
+        SendInput(1, &input, sizeof(INPUT));
+    }
+
+    // Presses and releases a virtual-key via SendInput — injected into
+    // the real system input stream, the same layer actual hardware
+    // events land on. This is what lets it reach a game that has
+    // acquired the keyboard through DirectInput in EXCLUSIVE mode
+    // (the normal fullscreen case): PostMessage only ever reached the
+    // window's message queue, which exclusive-mode input ignores
+    // entirely — that's why typing only worked in windowed mode before.
+    void PressVK(WORD vk)
+    {
+        SendVKEvent(vk, 0);
+        Sleep(15);
+        SendVKEvent(vk, KEYEVENTF_KEYUP);
+        Sleep(15);
+    }
+
     void SendCharToWindow(HWND hwnd, char c)
     {
-        PostMessageA(hwnd, WM_CHAR, static_cast<WPARAM>(c), 0);
-        Sleep(15);
+        EnsureForeground(hwnd);
+        // Digit characters' ASCII values are numerically identical to
+        // their virtual-key codes ('0'..'9' == VK 0x30..0x39), so the
+        // char can be used directly as the VK for SendInput.
+        PressVK(static_cast<WORD>(c));
     }
 
     void SendKeyToWindow(HWND hwnd, WORD vk)
     {
-        PostMessageA(hwnd, WM_KEYDOWN, vk, 0);
-        Sleep(15);
-        PostMessageA(hwnd, WM_KEYUP, vk, 0);
-        Sleep(15);
+        EnsureForeground(hwnd);
+        PressVK(vk);
     }
 
     // Confirmed for R1 via imring/SF.lua's dxut.lua:
@@ -936,10 +978,83 @@ namespace Detection
     }
 }
 
+// ----------------------------------------------------------------
+// InputHook: detects the Y keypress via a low-level keyboard hook.
+//
+// GetAsyncKeyState polling was tried first, but games that acquire
+// the keyboard through DirectInput in EXCLUSIVE mode (common for
+// fullscreen titles like GTA SA) can make polling APIs blind to keys
+// even though the game itself still receives them. WH_KEYBOARD_LL
+// taps in at the driver level, before that exclusivity matters, which
+// is the standard technique game trainers/mods use for hotkeys that
+// need to work regardless of what has input focus/capture.
+//
+// A low-level hook is delivered via the hook-owning thread's message
+// queue, so — unlike the old Sleep-based poll — this needs a thread
+// that's actually running GetMessage/DispatchMessage.
+// ----------------------------------------------------------------
+namespace InputHook
+{
+    HHOOK g_hook = nullptr;
+    std::atomic<bool> g_yDown{ false };
+
+    LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
+    {
+        if (nCode == HC_ACTION)
+        {
+            auto* kb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+
+            if (kb->vkCode == 'Y')
+            {
+                if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
+                {
+                    if (!g_yDown) // rising edge only — ignore OS key-repeat while held
+                    {
+                        g_yDown = true;
+                        Detection::TriggerOnYPress();
+                    }
+                }
+                else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)
+                {
+                    g_yDown = false;
+                }
+            }
+        }
+
+        return CallNextHookEx(g_hook, nCode, wParam, lParam);
+    }
+
+    DWORD WINAPI InstallAndPump(LPVOID)
+    {
+        g_hook = SetWindowsHookExA(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_hModule, 0);
+
+        if (!g_hook)
+        {
+            Log::Write("Failed to install low-level keyboard hook (error %lu).", GetLastError());
+            return 0;
+        }
+
+        Log::Write("Low-level keyboard hook installed. Waiting for Y presses.");
+
+        // Low-level hooks are only delivered while this thread pumps
+        // messages — this call blocks here for the life of the DLL.
+        MSG msg;
+        while (GetMessage(&msg, nullptr, 0, 0))
+        {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+
+        UnhookWindowsHookEx(g_hook);
+        return 0;
+    }
+}
+
 DWORD WINAPI MainThread(LPVOID)
 {
     Log::Init();
     Log::Write("SA-MP Detective Dialog Solver (0.3.7-R1) — started.");
+
 
     while (!GetModuleHandleA("gta_sa.exe"))
         Sleep(100);
@@ -953,21 +1068,11 @@ DWORD WINAPI MainThread(LPVOID)
 
     Log::Write("Ready. Press Y in-game to scan for the Code Decoder dialog.");
 
-    // Lightweight key-state poll only — no memory reads happen here at
-    // all unless Y is actually pressed, which is what keeps this loop
-    // cheap enough to run forever.
-    bool wasYDown = false;
-
-    while (true)
-    {
-        bool isYDown = (GetAsyncKeyState('Y') & 0x8000) != 0;
-
-        if (isYDown && !wasYDown)
-            Detection::TriggerOnYPress();
-
-        wasYDown = isYDown;
-        Sleep(150);
-    }
+    // Dedicated thread: installs the low-level keyboard hook and pumps
+    // messages for it, for the remaining lifetime of the DLL.
+    HANDLE hookThread = CreateThread(nullptr, 0, InputHook::InstallAndPump, nullptr, 0, nullptr);
+    if (hookThread)
+        CloseHandle(hookThread);
 
     return 0;
 }
@@ -978,6 +1083,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
 
     if (reason == DLL_PROCESS_ATTACH)
     {
+        g_hModule = hModule;
         DisableThreadLibraryCalls(hModule);
 
         HANDLE thread = CreateThread(nullptr, 0, MainThread, nullptr, 0, nullptr);
