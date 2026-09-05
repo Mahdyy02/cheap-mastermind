@@ -519,21 +519,6 @@ namespace GameInput
         return data.hwnd;
     }
 
-    // Makes sure our synthetic input actually lands on the game: SendInput
-    // delivers to whatever window currently has OS-level keyboard focus,
-    // same as real hardware input would. If the game somehow isn't
-    // foreground (e.g. focus slipped after alt-tab), force it back —
-    // this is a no-op in the normal case where the player is actively
-    // playing when they trigger this.
-    void EnsureForeground(HWND hwnd)
-    {
-        if (GetForegroundWindow() != hwnd)
-        {
-            SetForegroundWindow(hwnd);
-            Sleep(50);
-        }
-    }
-
     void SendVKEvent(WORD vk, DWORD flags)
     {
         INPUT input = {};
@@ -545,11 +530,8 @@ namespace GameInput
 
     // Presses and releases a virtual-key via SendInput — injected into
     // the real system input stream, the same layer actual hardware
-    // events land on. This is what lets it reach a game that has
-    // acquired the keyboard through DirectInput in EXCLUSIVE mode
-    // (the normal fullscreen case): PostMessage only ever reached the
-    // window's message queue, which exclusive-mode input ignores
-    // entirely — that's why typing only worked in windowed mode before.
+    // events land on. Used only for pure functional keys (Backspace/
+    // Enter/Delete) whose VK meaning doesn't depend on keyboard layout.
     void PressVK(WORD vk)
     {
         SendVKEvent(vk, 0);
@@ -558,18 +540,49 @@ namespace GameInput
         Sleep(15);
     }
 
-    void SendCharToWindow(HWND hwnd, char c)
+    void SendUnicodeCharEvent(wchar_t ch, DWORD extraFlags)
     {
-        EnsureForeground(hwnd);
-        // Digit characters' ASCII values are numerically identical to
-        // their virtual-key codes ('0'..'9' == VK 0x30..0x39), so the
-        // char can be used directly as the VK for SendInput.
-        PressVK(static_cast<WORD>(c));
+        INPUT input = {};
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = 0;
+        input.ki.wScan = static_cast<WORD>(ch);
+        input.ki.dwFlags = KEYEVENTF_UNICODE | extraFlags;
+        SendInput(1, &input, sizeof(INPUT));
     }
 
-    void SendKeyToWindow(HWND hwnd, WORD vk)
+    // Presses and releases a character via KEYEVENTF_UNICODE — this
+    // injects the actual character directly instead of a physical key
+    // position, so it's independent of the active keyboard layout.
+    // A raw VK code (e.g. VK '0'..'9' == 0x30..0x39) instead sends
+    // "whatever character this physical key produces under the CURRENT
+    // layout" — on AZERTY, that same row produces "&é\"'(-è_çà"
+    // unshifted, which is exactly the garbled output that was showing
+    // up instead of digits.
+    void PressUnicodeChar(char c)
     {
-        EnsureForeground(hwnd);
+        wchar_t wc = static_cast<wchar_t>(static_cast<unsigned char>(c));
+        SendUnicodeCharEvent(wc, 0);
+        Sleep(15);
+        SendUnicodeCharEvent(wc, KEYEVENTF_KEYUP);
+        Sleep(15);
+    }
+
+    // NOTE: hwnd is intentionally unused here. SendInput delivers to
+    // whatever window currently has OS-level keyboard focus, same as
+    // real hardware input — an earlier version called
+    // SetForegroundWindow(hwnd) to guarantee that, but doing so while a
+    // Direct3D EXCLUSIVE FULLSCREEN app is running is exactly what
+    // causes it to minimize (Windows treats any forced window
+    // activation the same as Alt-Tab/the Win key). Since the player is
+    // the one triggering this by pressing Y while actively playing, the
+    // game already legitimately has focus — we must NOT force it.
+    void SendCharToWindow(HWND /*hwnd*/, char c)
+    {
+        PressUnicodeChar(c);
+    }
+
+    void SendKeyToWindow(HWND /*hwnd*/, WORD vk)
+    {
         PressVK(vk);
     }
 
