@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdarg>
 #include <cstring>
 #include <cctype>
 #include <string>
@@ -13,7 +14,69 @@
 #include <atomic>
 #include <initializer_list>
 
+// ============================================================
+// SA-MP 0.3.7-R1 "Detective - Code Decoder" auto-solver
+//
+// Pipeline:
+//   1. Player presses Y.
+//   2. We scan for the dialog for up to 5 seconds. If found (and
+//      fresh — no previous-guess rows yet), we start solving.
+//   3. If nothing turns up in 5 seconds, we press Delete x4 and
+//      give it one more 5-second scan (10 seconds total across both
+//      rounds). If that also finds nothing, we give up silently.
+//   4. Once solving starts: send the next guess via simulated
+//      keystrokes (verified against the edit box's real text before
+//      Enter is ever pressed), wait for the dialog to reopen with an
+//      extra "PREVIOUS GUESSES" row, parse its {colour}digit tokens
+//      into a G/Y/R string (this REPLACES the python guess_result()
+//      function — the game itself is the oracle), and feed that back
+//      into the same solver state machine from the original script.
+// ============================================================
 
+// ----------------------------------------------------------------
+// Log: no console window (it added overhead and wasn't useful) —
+// everything goes to a plain text file instead.
+// ----------------------------------------------------------------
+namespace Log
+{
+    FILE* g_file = nullptr;
+
+    void Init()
+    {
+        char tempPath[MAX_PATH] = { 0 };
+        GetTempPathA(MAX_PATH, tempPath);
+
+        std::string path = std::string(tempPath) + "samp_detective_solver.log";
+        fopen_s(&g_file, path.c_str(), "w");
+    }
+
+    void Write(const char* fmt, ...)
+    {
+        if (!g_file)
+            return;
+
+        va_list args;
+        va_start(args, fmt);
+        vfprintf(g_file, fmt, args);
+        va_end(args);
+
+        fprintf(g_file, "\n");
+        fflush(g_file);
+    }
+
+    void Close()
+    {
+        if (g_file)
+        {
+            fclose(g_file);
+            g_file = nullptr;
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// SampDialog: memory reading (unchanged offsets from before)
+// ----------------------------------------------------------------
 namespace SampDialog
 {
     constexpr uintptr_t DIALOG_INFO_OFFSET = 0x21A0B8; // confirmed R1
@@ -200,7 +263,15 @@ namespace SampDialog
         return true;
     }
 
-
+    // ----------------------------------------------------------
+    // Parses the "PREVIOUS GUESSES" section of the dialog body into
+    // a list of 4-char G/Y/R strings, one per row, in order.
+    //
+    // Row format in the raw text:
+    //   {FFFFFF}1. {FFD966}0 {FF5555}1 {FF5555}2 {FFD966}3
+    //
+    // {33CC33} = G   {FFD966} = Y   {FF5555} = R
+    // ----------------------------------------------------------
     std::vector<std::string> ParseFeedbackRows(const std::string& text)
     {
         std::vector<std::string> rows;
@@ -529,18 +600,18 @@ namespace GameInput
                 return true;
             }
 
-            printf("[Solver] Input verify failed (attempt %d/%d): wanted '%s', box has '%s' — retrying.\n",
-                   attempt, maxAttempts, guess.c_str(), readBack.c_str());
+            Log::Write("[Solver] Input verify failed (attempt %d/%d): wanted '%s', box has '%s' — retrying.",
+                       attempt, maxAttempts, guess.c_str(), readBack.c_str());
         }
 
-        printf("[Solver] Could not reliably type '%s' after %d attempts — NOT pressing Enter.\n",
-               guess.c_str(), maxAttempts);
+        Log::Write("[Solver] Could not reliably type '%s' after %d attempts — NOT pressing Enter.",
+                   guess.c_str(), maxAttempts);
         return false;
     }
 }
 
 // ----------------------------------------------------------------
-// Automation: state, trigger hook, and the live solve loop
+// Automation: the live solve loop
 // ----------------------------------------------------------------
 namespace Automation
 {
@@ -550,7 +621,7 @@ namespace Automation
 
     void RunSolve(HWND hwnd)
     {
-        printf("\n[Solver] /guessdetective triggered — starting solve.\n");
+        Log::Write("[Solver] Starting solve.");
 
         // guesses = ["8900", "4567", "0123"]
         std::vector<std::string> guesses = { "8900", "4567", "0123" };
@@ -567,7 +638,7 @@ namespace Automation
         {
             if (c > 7)
             {
-                printf("[Solver] Failed to guess in 7 tries.\n");
+                Log::Write("[Solver] Failed to guess in 7 tries.");
                 break;
             }
 
@@ -616,7 +687,7 @@ namespace Automation
 
                     if (guesses.empty())
                     {
-                        printf("[Solver] No more guesses left.\n");
+                        Log::Write("[Solver] No more guesses left.");
                         break;
                     }
                 }
@@ -626,7 +697,7 @@ namespace Automation
             guesses.pop_back();
             guessed.push_back(guess);
 
-            printf("[Solver] Attempt %d: sending guess %s\n", c, guess.c_str());
+            Log::Write("[Solver] Attempt %d: sending guess %s", c, guess.c_str());
 
             Sleep(200); // requested small delay before each try
 
@@ -634,7 +705,7 @@ namespace Automation
 
             if (!sent)
             {
-                printf("[Solver] Aborting — could not reliably submit the guess.\n");
+                Log::Write("[Solver] Aborting — could not reliably submit the guess.");
                 break;
             }
 
@@ -642,16 +713,16 @@ namespace Automation
 
             if (res.empty())
             {
-                printf("[Solver] Timed out waiting for dialog feedback — aborting.\n");
+                Log::Write("[Solver] Timed out waiting for dialog feedback — aborting.");
                 break;
             }
 
-            printf("[Solver] Result: %s\n", res.c_str());
+            Log::Write("[Solver] Result: %s", res.c_str());
 
             if (res == "GGGG")
             {
                 found = true;
-                printf("[Solver] SOLVED on attempt %d: %s\n", c, guess.c_str());
+                Log::Write("[Solver] SOLVED on attempt %d: %s", c, guess.c_str());
                 break;
             }
 
@@ -726,7 +797,7 @@ namespace Automation
 
         if (!hwnd)
         {
-            printf("[Solver] Could not find game window.\n");
+            Log::Write("[Solver] Could not find game window.");
             g_solverRunning = false;
             return 0;
         }
@@ -737,108 +808,165 @@ namespace Automation
         return 0;
     }
 
-    void TriggerSolve()
+    // Spawns the solver thread. Caller (Detection) is responsible for
+    // having already confirmed a fresh dialog is present.
+    void StartSolverThread()
     {
-        if (g_solverRunning)
-            return; // already running, ignore
-
-        HWND hwnd = GameInput::FindGameWindow();
-        if (!hwnd)
-        {
-            printf("[Solver] Could not find game window.\n");
-            return;
-        }
-
         g_solverRunning = true;
         HANDLE t = CreateThread(nullptr, 0, SolverThread, nullptr, 0, nullptr);
         if (t) CloseHandle(t);
     }
 }
 
-void CreateDebugConsole()
+// ----------------------------------------------------------------
+// Detection: bounded, Y-key-triggered scanning.
+//
+// Replaces the old always-on 100ms polling loop, which kept doing
+// VirtualQuery/GetModuleHandle calls forever even when nothing was
+// happening — cheap individually, but frequent enough (10/sec,
+// forever) to cause noticeable stutter, especially under a VM where
+// those are real kernel transitions.
+//
+// New behaviour: do nothing at all until the player presses Y. Then:
+//   - scan for a fresh "Code Decoder" dialog for up to 5 seconds
+//   - if not found, press Delete x4 and scan for up to 5 more seconds
+//     (10 seconds total across both rounds)
+//   - if still not found, give up and go back to doing nothing
+// ----------------------------------------------------------------
+namespace Detection
 {
-    if (!GetConsoleWindow())
-        AllocConsole();
+    std::atomic<bool> g_running{ false };
 
-    FILE* file = nullptr;
-    freopen_s(&file, "CONOUT$", "w", stdout);
-    freopen_s(&file, "CONOUT$", "w", stderr);
-    freopen_s(&file, "CONIN$", "r", stdin);
-    setvbuf(stdout, nullptr, _IONBF, 0);
-
-    printf("\n");
-    printf("==================================================\n");
-    printf(" SA-MP Detective Dialog Solver (0.3.7-R1)\n");
-    printf("==================================================\n");
-    printf("Console initialized.\n");
-}
-
-void CheckDialog()
-{
-    static bool wasOpen = false;
-
-    if (Automation::g_solverRunning)
-        return; // solver has its own WaitForFeedback polling; avoid noisy dupes
-
-    uintptr_t dialog = SampDialog::GetDialogPointer();
-    bool isOpen = dialog != 0 && SampDialog::IsDialogActive(dialog);
-
-    if (isOpen && !wasOpen)
+    // Returns true the moment a fresh (no previous-guess rows yet)
+    // "Code Decoder" dialog is seen, polling every 100ms until
+    // `windowMs` elapses.
+    bool ScanForDialog(DWORD windowMs)
     {
-        SampDialog::DialogSnapshot snap;
-        if (SampDialog::GetDialogSnapshot(dialog, snap))
+        DWORD start = GetTickCount();
+
+        while (GetTickCount() - start < windowMs)
         {
-            printf("\n[Dialog] Opened: %s (id %d)\n", snap.caption.c_str(), snap.id);
+            uintptr_t dialog = SampDialog::GetDialogPointer();
 
-            if (snap.caption.find("Code Decoder") != std::string::npos)
+            if (dialog && SampDialog::IsDialogActive(dialog))
             {
-                auto rows = SampDialog::ParseFeedbackRows(snap.text);
+                SampDialog::DialogSnapshot snap;
+                if (SampDialog::GetDialogSnapshot(dialog, snap))
+                {
+                    if (snap.caption.find("Code Decoder") != std::string::npos)
+                    {
+                        auto rows = SampDialog::ParseFeedbackRows(snap.text);
 
-                if (rows.empty())
-                {
-                    Automation::TriggerSolve();
-                }
-                else
-                {
-                    printf("[Dialog] Puzzle already has %zu previous guess(es) — "
-                           "not auto-starting (would restart from scratch).\n",
-                           rows.size());
+                        if (rows.empty())
+                        {
+                            Log::Write("[Detection] Fresh 'Code Decoder' dialog found.");
+                            return true;
+                        }
+                        else
+                        {
+                            Log::Write("[Detection] Dialog found but already has %zu previous "
+                                       "guess(es) — ignoring (would restart from scratch).",
+                                       rows.size());
+                        }
+                    }
                 }
             }
+
+            Sleep(100);
         }
-    }
-    else if (!isOpen && wasOpen)
-    {
-        printf("[Dialog] Closed.\n");
+
+        return false;
     }
 
-    wasOpen = isOpen;
+    void PressDeleteKeys(HWND hwnd, int times)
+    {
+        for (int i = 0; i < times; ++i)
+        {
+            GameInput::SendKeyToWindow(hwnd, VK_DELETE);
+            Sleep(150);
+        }
+    }
+
+    DWORD WINAPI SequenceThread(LPVOID)
+    {
+        Log::Write("[Detection] Y pressed — starting 5s scan.");
+
+        HWND hwnd = GameInput::FindGameWindow();
+        if (!hwnd)
+        {
+            Log::Write("[Detection] Could not find game window — aborting.");
+            g_running = false;
+            return 0;
+        }
+
+        bool found = ScanForDialog(5000);
+
+        if (!found)
+        {
+            Log::Write("[Detection] Nothing found in first 5s — pressing Delete x4 and trying "
+                       "5 more seconds (10s total).");
+
+            PressDeleteKeys(hwnd, 4);
+            found = ScanForDialog(5000);
+        }
+
+        if (found)
+        {
+            Automation::StartSolverThread();
+        }
+        else
+        {
+            Log::Write("[Detection] No dialog found after 10s total — giving up.");
+        }
+
+        g_running = false;
+        return 0;
+    }
+
+    // Call this on a Y keypress (rising edge). No-op if a scan or a
+    // solve is already in progress.
+    void TriggerOnYPress()
+    {
+        if (g_running || Automation::g_solverRunning)
+            return;
+
+        g_running = true;
+        HANDLE t = CreateThread(nullptr, 0, SequenceThread, nullptr, 0, nullptr);
+        if (t) CloseHandle(t);
+    }
 }
 
 DWORD WINAPI MainThread(LPVOID)
 {
-    CreateDebugConsole();
+    Log::Init();
+    Log::Write("SA-MP Detective Dialog Solver (0.3.7-R1) — started.");
 
-    printf("Waiting for GTA SA...\n");
     while (!GetModuleHandleA("gta_sa.exe"))
         Sleep(100);
-    printf("gta_sa.exe detected.\n");
+    Log::Write("gta_sa.exe detected.");
 
-    printf("Waiting for samp.dll...\n");
     while (!GetModuleHandleA("samp.dll"))
         Sleep(100);
-    printf("samp.dll detected.\n");
+    Log::Write("samp.dll detected.");
 
-    printf("Waiting for SA-MP initialization...\n");
-    Sleep(2000);
+    Sleep(2000); // let SA-MP finish initializing
 
-    printf("Dialog monitor started.\n");
-    printf("Will auto-solve as soon as the 'Code Decoder' dialog is detected.\n");
+    Log::Write("Ready. Press Y in-game to scan for the Code Decoder dialog.");
+
+    // Lightweight key-state poll only — no memory reads happen here at
+    // all unless Y is actually pressed, which is what keeps this loop
+    // cheap enough to run forever.
+    bool wasYDown = false;
 
     while (true)
     {
-        CheckDialog();
-        Sleep(100);
+        bool isYDown = (GetAsyncKeyState('Y') & 0x8000) != 0;
+
+        if (isYDown && !wasYDown)
+            Detection::TriggerOnYPress();
+
+        wasYDown = isYDown;
+        Sleep(150);
     }
 
     return 0;
@@ -855,6 +983,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved)
         HANDLE thread = CreateThread(nullptr, 0, MainThread, nullptr, 0, nullptr);
         if (thread)
             CloseHandle(thread);
+    }
+    else if (reason == DLL_PROCESS_DETACH)
+    {
+        Log::Close();
     }
 
     return TRUE;
